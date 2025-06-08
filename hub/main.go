@@ -27,7 +27,7 @@ type Subscriber struct {
 
 var (
 	subscribersMu sync.RWMutex
-	subscribers   = make([]Subscriber, 0)
+	subscribers   = make(map[string]Subscriber, 0)
 )
 
 func main() {
@@ -51,9 +51,24 @@ func generateChallenge(length int) string {
 // handle subscription and verify intent
 func subscriptionHandler(w http.ResponseWriter, r *http.Request) {
 	// handle subscription
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	contentType := r.Header.Get("Content-Type")
+	if !strings.HasPrefix(contentType, "application/x-www-form-urlencoded") {
+		w.Header().Set("Accept-Post", "application/x-www-form-urlencoded; charset=UTF-8")
+		http.Error(w, "Content-Type not valid", http.StatusUnsupportedMediaType)
+		return
+
+	}
+
 	err := r.ParseForm()
 	if err != nil {
 		http.Error(w, "Could not parse form", http.StatusBadRequest)
+		return
 	}
 
 	mode := r.PostForm.Get("hub.mode")
@@ -61,56 +76,80 @@ func subscriptionHandler(w http.ResponseWriter, r *http.Request) {
 	callback := r.PostForm.Get("hub.callback")
 	secret := r.PostForm.Get("hub.secret")
 
-	if topic == "" || callback == "" || mode != "subscribe" {
-		http.Error(w, "Invalid or missing parameters", http.StatusBadRequest)
-	}
-
-	// verify intent
-	challenge := generateChallenge(16)
-	leaseSeconds := 700000
-
-	u, _ := url.Parse(callback)
-
-	query := u.Query()
-	query.Set("hub.mode", mode)
-	query.Set("hub.topic", topic)
-	query.Set("hub.challenge", challenge)
-	query.Set("hub.lease_seconds", fmt.Sprintf("%d", leaseSeconds))
-
-	u.RawQuery = query.Encode()
-	getURL := u.String()
-
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Get(getURL)
-	if err != nil {
-		http.Error(w, "GET request failed", http.StatusBadRequest)
+	if topic == "" || callback == "" || (mode != "subscribe" && mode != "unsubscribe") {
+		http.Error(w, "Invalid or missing parameters (topic, callback or mode)", http.StatusBadRequest)
 		return
 	}
 
-	body, err := io.ReadAll(resp.Body)
-	defer resp.Body.Close()
-	if err != nil {
-		http.Error(w, "unable to read response", http.StatusBadGateway)
-	}
+	w.WriteHeader(http.StatusAccepted)
 
-	bodyString := string(body)
-	if resp.StatusCode > 299 || resp.StatusCode < 200 || bodyString != challenge {
-		http.Error(w, "Verification failed", http.StatusBadRequest)
-	}
+	go func(mode, topic, callback, secret string) {
 
-	fmt.Println("Subscription successful!")
+		// verify intent
+		challenge := generateChallenge(16)
+		leaseSeconds := 700000
 
-	sub := Subscriber{
-		Callback:     callback,
-		Topic:        topic,
-		Secret:       secret,
-		LeaseSeconds: leaseSeconds,
-	}
+		u, err := url.Parse(callback)
+		if err != nil {
+			log.Println("Invalid callback URL", err)
+			return
+		}
 
-	subscribersMu.Lock()
-	defer subscribersMu.Unlock()
-	subscribers = append(subscribers, sub)
-	fmt.Println("Saved subscriber", sub)
+		query := u.Query()
+		query.Set("hub.mode", mode)
+		query.Set("hub.topic", topic)
+		query.Set("hub.challenge", challenge)
+		query.Set("hub.lease_seconds", fmt.Sprintf("%d", leaseSeconds))
+
+		u.RawQuery = query.Encode()
+		getURL := u.String()
+
+		client := &http.Client{Timeout: 10 * time.Second}
+		resp, err := client.Get(getURL)
+		if err != nil {
+			log.Println("Callback GET failed", err)
+			return
+		}
+
+		defer resp.Body.Close()
+
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			log.Println("Failed to read response", err)
+			return
+		}
+
+		bodyString := string(body)
+		if resp.StatusCode > 299 || resp.StatusCode < 200 || bodyString != challenge {
+			log.Println("Verification failed for", callback)
+			return
+		}
+
+		key := topic + "||" + callback
+
+		subscribersMu.Lock()
+		defer subscribersMu.Unlock()
+
+		switch mode {
+
+		case "subscribe":
+
+			sub := Subscriber{
+				Callback:     callback,
+				Topic:        topic,
+				Secret:       secret,
+				LeaseSeconds: leaseSeconds,
+			}
+
+			subscribers[key] = sub
+			log.Println("Saved subscriber", sub)
+
+		case "unsubscribe":
+			delete(subscribers, key)
+			log.Println("Subscriber deleted:", key)
+
+		}
+	}(mode, topic, callback, secret)
 
 }
 
